@@ -1,10 +1,9 @@
 // ============================================================
 // VexzHub Relay API
 // Nhận data từ script Roblox (đã xác thực bằng id/apiKey),
-// KHÔNG giải mã jobId ra dạng thô — giữ nguyên dạng đã mã hoá
-// ("VexzHub" + base64) và nhét thẳng vào đoạn code copy-paste
-// (kèm hàm tự giải mã bên trong) rồi forward embed sang đúng
-// Discord webhook được cấu hình cho id đó.
+// KHÔNG giải mã jobId — giữ nguyên dạng đã mã hoá "VexzHub|<base64>"
+// và hiển thị thẳng trong embed (Job Id PC Copy / Job Id Mobile Copy),
+// rồi forward sang đúng Discord webhook được cấu hình cho id đó.
 // ============================================================
 
 const express = require("express");
@@ -19,10 +18,8 @@ try {
   console.error("❌ CONFIG_JSON không parse được — kiểm tra lại JSON dán trong Render Environment:", e.message);
 }
 
-const app = express();
-app.use(express.json());
-
-// Nhãn category hiển thị trong embed, map theo "id" (không phụ thuộc user chỉnh sửa)
+// Nhãn field hiển thị theo đúng loại sự kiện, thay vì luôn ghi cứng "Name"
+// (Prehistoric Island là đảo sự kiện chứ không phải boss, nên phải ghi đúng)
 const CATEGORY_BY_ID = {
   id_darkbeard: "Boss",
   id_cursed_captain: "Boss",
@@ -40,12 +37,15 @@ const CATEGORY_BY_ID = {
   id_kitsune: "Island",
   id_prehistoric: "Island",
   id_leviathan: "Island",
-  id_full_moon: "Event",
+  id_full_moon: "Full Moon",
   id_pirate_raid: "Event",
   id_sword_dealer: "Dealer",
   id_haki_dealer: "Dealer",
-  id_cake_spawner: "Event",
+  id_cake_spawner: "Boss",
 };
+
+const app = express();
+app.use(express.json());
 
 // Chặn spam gọi liên tục cùng 1 job trong thời gian ngắn (tránh Discord rate-limit / spam kênh)
 const lastSentCache = new Map(); // key: `${id}:${boss}:${encodedJob}` -> timestamp
@@ -59,37 +59,22 @@ function isDuplicate(key) {
   return false;
 }
 
-// Đoạn code Lua tự giải mã "VexzHub"+base64 rồi gọi remote hop server.
-// jobId THẬT không bao giờ xuất hiện dạng thô trong tin nhắn Discord —
-// chỉ ai paste đoạn code này vào exploit thì mới decode ra lúc chạy.
-function buildJoinScriptPretty(encodedJob) {
-  return `local encoded = "${encodedJob}"
-local b64chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
-local function base64_decode(data)
-    data = string.gsub(data, '[^'..b64chars..'=]', '')
-    return (data:gsub('.', function(x)
-        if x == '=' then return '' end
-        local r, f = '', (b64chars:find(x) - 1)
-        for i = 6, 1, -1 do r = r .. (f % 2^i - f % 2^(i-1) > 0 and '1' or '0') end
-        return r
-    end):gsub('%d%d%d?%d?%d?%d?%d?%d?', function(x)
-        if #x ~= 8 then return '' end
-        local c = 0
-        for i = 1, 8 do c = c + (x:sub(i, i) == '1' and 2^(8 - i) or 0) end
-        return string.char(c)
-    end))
-end
-local jobId = base64_decode(encoded:sub(8))
-game:GetService("ReplicatedStorage").__ServerBrowser:InvokeServer("teleport", jobId)`;
-}
-
-function buildJoinScriptMinified(encodedJob) {
-  return `local encoded="${encodedJob}";local b64chars='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';local function base64_decode(data) data=string.gsub(data,'[^'..b64chars..'=]',''); return (data:gsub('.',function(x) if x=='=' then return '' end local r,f='',(b64chars:find(x)-1) for i=6,1,-1 do r=r..(f%2^i-f%2^(i-1)>0 and '1' or '0') end return r end):gsub('%d%d%d?%d?%d?%d?%d?%d?',function(x) if #x~=8 then return '' end local c=0 for i=1,8 do c=c+(x:sub(i,i)=='1' and 2^(8-i) or 0) end return string.char(c) end)) end local jobId=base64_decode(encoded:sub(8)); game:GetService("ReplicatedStorage").__ServerBrowser:InvokeServer("teleport", jobId)`;
+// "2026-08-29 21:21:49" — giờ server (UTC), format giống mẫu
+function formatTime(date) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return (
+    date.getUTCFullYear() +
+    "-" + pad(date.getUTCMonth() + 1) +
+    "-" + pad(date.getUTCDate()) +
+    " " + pad(date.getUTCHours()) +
+    ":" + pad(date.getUTCMinutes()) +
+    ":" + pad(date.getUTCSeconds())
+  );
 }
 
 app.post("/push", async (req, res) => {
   try {
-    const { id, apiKey, job, players, sea, boss } = req.body || {};
+    const { id, apiKey, job, players, maxPlayers, sea, boss } = req.body || {};
 
     if (!id || !apiKey || !job || !boss) {
       return res.status(400).json({ error: "missing required fields" });
@@ -100,10 +85,10 @@ app.post("/push", async (req, res) => {
       return res.status(401).json({ error: "invalid id or apiKey" });
     }
 
-    // Kiểm tra sơ format (đúng tiền tố "VexzHub"), KHÔNG decode ra dùng để hiển thị
-    const PREFIX = "VexzHub";
+    // Kiểm tra sơ format (đúng tiền tố "VexzHub|"), KHÔNG decode ra dùng để hiển thị
+    const PREFIX = "VexzHub|";
     if (typeof job !== "string" || !job.startsWith(PREFIX)) {
-      return res.status(400).json({ error: "invalid job format (missing VexzHub prefix)" });
+      return res.status(400).json({ error: "invalid job format (missing VexzHub| prefix)" });
     }
 
     const dedupeKey = `${id}:${boss}:${job}`;
@@ -111,24 +96,20 @@ app.post("/push", async (req, res) => {
       return res.json({ ok: true, skipped: "duplicate" });
     }
 
-    const category = CATEGORY_BY_ID[id] || "Notify";
-    const mobileCopy = buildJoinScriptMinified(job);
-    const pcCopy = buildJoinScriptPretty(job);
+    const category = CATEGORY_BY_ID[id] || "Name";
 
     const discordBody = {
       embeds: [
         {
           color: 16753920,
           fields: [
-            { name: "📌 Name", value: category, inline: true },
-            { name: "🌊 Sea", value: "Sea " + String(sea ?? "?"), inline: true },
-            { name: "👥 Players", value: String(players ?? "?"), inline: true },
+            { name: "Player Count", value: `${players ?? "?"}/${maxPlayers ?? "?"}` },
+            { name: "World", value: `World ${sea ?? "?"}` },
             { name: category, value: String(boss) },
-            { name: "📱 Mobile Copy", value: "```lua\n" + mobileCopy + "\n```" },
-            { name: "💻 PC Copy", value: "```lua\n" + pcCopy + "\n```" },
-            { name: "🆔 Job ID (Encoded)", value: "```" + job + "```" },
+            { name: "Job Id PC Copy", value: "```" + job + "```" },
+            { name: "Job Id Mobile Copy", value: "`" + job + "`" },
+            { name: "Time", value: formatTime(new Date()) },
           ],
-          timestamp: new Date().toISOString(),
         },
       ],
     };
