@@ -1,25 +1,16 @@
-// ============================================================
-// VexzHub Relay API
-// Nhận data từ script Roblox (đã xác thực bằng id/apiKey),
-// KHÔNG giải mã jobId — giữ nguyên dạng đã mã hoá "VexzHub|<base64>"
-// và hiển thị thẳng trong embed (Job Id PC Copy / Job Id Mobile Copy),
-// rồi forward sang đúng Discord webhook được cấu hình cho id đó.
-// ============================================================
-
 const express = require("express");
 const fetch = require("node-fetch");
 
-// Đọc config từ biến môi trường CONFIG_JSON (Render) thay vì file config.json
-// -> webhook URL thật không nằm trong code/git nữa, chỉ nằm trong Render dashboard.
 let config = {};
 try {
   config = JSON.parse(process.env.CONFIG_JSON || "{}");
 } catch (e) {
-  console.error("❌ CONFIG_JSON không parse được — kiểm tra lại JSON dán trong Render Environment:", e.message);
+  console.error(
+    "❌ CONFIG_JSON không parse được — kiểm tra lại JSON dán trong Render Environment:",
+    e.message
+  );
 }
 
-// Nhãn field hiển thị theo đúng loại sự kiện, thay vì luôn ghi cứng "Name"
-// (Prehistoric Island là đảo sự kiện chứ không phải boss, nên phải ghi đúng)
 const CATEGORY_BY_ID = {
   id_darkbeard: "Boss",
   id_cursed_captain: "Boss",
@@ -42,14 +33,14 @@ const CATEGORY_BY_ID = {
   id_sword_dealer: "Dealer",
   id_haki_dealer: "Dealer",
   id_cake_spawner: "Boss",
+  id_server_4h: "Server 4H",
 };
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
-// Chặn spam gọi liên tục cùng 1 job trong thời gian ngắn (tránh Discord rate-limit / spam kênh)
-const lastSentCache = new Map(); // key: `${id}:${boss}:${encodedJob}` -> timestamp
-const DEDUPE_WINDOW_MS = 60 * 1000; // 60s
+const lastSentCache = new Map();
+const DEDUPE_WINDOW_MS = 60 * 1000;
 
 function isDuplicate(key) {
   const now = Date.now();
@@ -59,7 +50,13 @@ function isDuplicate(key) {
   return false;
 }
 
-// "2026-08-29 21:21:49" — giờ server (UTC), format giống mẫu
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, t] of lastSentCache) {
+    if (now - t > DEDUPE_WINDOW_MS * 10) lastSentCache.delete(k);
+  }
+}, 5 * 60 * 1000);
+
 function formatTime(date) {
   const pad = (n) => String(n).padStart(2, "0");
   return (
@@ -72,9 +69,28 @@ function formatTime(date) {
   );
 }
 
+// ====== BUILD EMBED MẶC ĐỊNH (client cũ) ======
+function buildDefaultEmbed({ category, boss, players, maxPlayers, sea, job }) {
+  return {
+    color: 16753920,
+    fields: [
+      { name: "Player Count", value: `${players ?? "?"}/${maxPlayers ?? "?"}` },
+      { name: "World", value: `World ${sea ?? "?"}` },
+      { name: category, value: String(boss) },
+      { name: "Job Id PC Copy", value: "```" + job + "```" },
+      { name: "Job Id Mobile Copy", value: "`" + job + "`" },
+      { name: "Time", value: formatTime(new Date()) },
+    ],
+    // Không có footer Notify By
+  };
+}
+
 app.post("/push", async (req, res) => {
   try {
-    const { id, apiKey, job, players, maxPlayers, sea, boss } = req.body || {};
+    const {
+      id, apiKey, job, players, maxPlayers, sea, boss,
+      placeId, embeds,
+    } = req.body || {};
 
     if (!id || !apiKey || !job || !boss) {
       return res.status(400).json({ error: "missing required fields" });
@@ -85,7 +101,6 @@ app.post("/push", async (req, res) => {
       return res.status(401).json({ error: "invalid id or apiKey" });
     }
 
-    // Kiểm tra sơ format (đúng tiền tố "VexzHub|"), KHÔNG decode ra dùng để hiển thị
     const PREFIX = "VexzHub|";
     if (typeof job !== "string" || !job.startsWith(PREFIX)) {
       return res.status(400).json({ error: "invalid job format (missing VexzHub| prefix)" });
@@ -96,23 +111,45 @@ app.post("/push", async (req, res) => {
       return res.json({ ok: true, skipped: "duplicate" });
     }
 
-    const category = CATEGORY_BY_ID[id] || "Name";
+    // ====== CHỌN EMBEDS GỬI ĐI ======
+    let finalEmbeds;
 
-    const discordBody = {
-      embeds: [
-        {
-          color: 16753920,
-          fields: [
-            { name: "Player Count", value: `${players ?? "?"}/${maxPlayers ?? "?"}` },
-            { name: "World", value: `World ${sea ?? "?"}` },
-            { name: category, value: String(boss) },
-            { name: "Job Id PC Copy", value: "```" + job + "```" },
-            { name: "Job Id Mobile Copy", value: "`" + job + "`" },
-            { name: "Time", value: formatTime(new Date()) },
-          ],
-        },
-      ],
-    };
+    if (Array.isArray(embeds) && embeds.length > 0) {
+      // Client gửi embeds -> dùng thẳng, CHỈ đảm bảo có Job ID, KHÔNG thêm footer
+      finalEmbeds = embeds.map((e) => {
+        const copy = JSON.parse(JSON.stringify(e));
+
+        if (!Array.isArray(copy.fields)) copy.fields = [];
+
+        const hasJobField = copy.fields.some(
+          (f) => typeof f.name === "string" && f.name.includes("Job")
+        );
+        if (!hasJobField) {
+          copy.fields.push({
+            name: "🔑 Job ID",
+            value: "```" + job + "```",
+            inline: false,
+          });
+        }
+
+        // Loại bỏ footer Notify By nếu client lỡ gửi
+        if (copy.footer && typeof copy.footer.text === "string" &&
+            copy.footer.text.includes("Notify By")) {
+          delete copy.footer;
+        }
+
+        return copy;
+      });
+    } else {
+      finalEmbeds = [
+        buildDefaultEmbed({
+          category: CATEGORY_BY_ID[id] || "Name",
+          boss, players, maxPlayers, sea, job,
+        }),
+      ];
+    }
+
+    const discordBody = { embeds: finalEmbeds };
 
     const discordRes = await fetch(entry.webhookUrl, {
       method: "POST",
@@ -133,14 +170,15 @@ app.post("/push", async (req, res) => {
   }
 });
 
-// health check, để test xem server sống chưa (mở link .../ping trên trình duyệt)
 app.get("/ping", (_req, res) => res.send("pong"));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("VexzHub Relay API đang chạy ở port " + PORT);
   if (Object.keys(config).length === 0) {
-    console.warn("⚠️  CONFIG_JSON đang rỗng hoặc chưa được set trong Render Environment — mọi request /push sẽ bị từ chối (401).");
+    console.warn(
+      "⚠️  CONFIG_JSON đang rỗng hoặc chưa được set trong Render Environment — mọi request /push sẽ bị từ chối (401)."
+    );
   } else {
     console.log("✅ Đã load config cho " + Object.keys(config).length + " id.");
   }
